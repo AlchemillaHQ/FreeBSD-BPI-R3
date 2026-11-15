@@ -1,0 +1,235 @@
+name: Images
+
+# Images for the Banana Pi BPI-R3, in two flavours: "nodebug"
+# (GENERIC-NODEBUG) and "debug" (GENERIC, with WITNESS and INVARIANTS).
+# Each flavour gives an SD card image, an eMMC image, and an eMMC
+# installer (an SD card image that writes the eMMC image).  Firmware and
+# kernels are cross-built on Linux; only the final assembly (pkgbase
+# userland, file systems, partition tables) runs in a FreeBSD VM.
+# See ci/ for the scripts, which also run locally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch of AlchemillaHQ/freebsd-src to build"
+        default: "bpi-r3/integration"
+  schedule:
+    - cron: "0 4 * * 1"  # Mondays, 04:00 UTC
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  SRC_REPO: AlchemillaHQ/freebsd-src
+  SRC_REF: ${{ inputs.ref || 'bpi-r3/integration' }}
+
+jobs:
+  firmware:
+    name: Firmware (TF-A, U-Boot)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential gcc-aarch64-linux-gnu bison flex bc \
+            libssl-dev libgnutls28-dev python3-dev python3-setuptools \
+            python3-pyelftools swig u-boot-tools device-tree-compiler \
+            uuid-dev
+      - name: Build
+        run: |
+          sh ci/firmware.sh out/firmware-sd sdmmc
+          sh ci/firmware.sh out/firmware-emmc emmc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-sd
+          path: out/firmware-sd
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-emmc
+          path: out/firmware-emmc
+          retention-days: 3
+      - name: Package
+        run: sh ci/firmware-tarball.sh out/firmware-sd out/firmware-emmc out/dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpi-r3-firmware
+          path: out/dist
+          compression-level: 0
+
+  base:
+    name: Userland (FreeBSD snapshot)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libarchive-tools
+      - name: Fetch
+        run: sh ci/base.sh out/base
+      - uses: actions/upload-artifact@v7
+        with:
+          name: base
+          path: out/base
+          retention-days: 3
+
+  kernel:
+    name: Kernel (${{ matrix.flavour }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - flavour: nodebug
+            kernconf: GENERIC-NODEBUG
+          - flavour: debug
+            kernconf: GENERIC
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SRC_REPO }}
+          ref: ${{ env.SRC_REF }}
+          path: src
+          fetch-depth: 1
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bmake bc time flex bison m4 file zlib1g-dev libbz2-dev \
+            libssl-dev libarchive-dev libarchive-tools clang-18 lld-18 \
+            llvm-18 device-tree-compiler
+      - name: Build
+        run: |
+          # The object tree is large; /mnt has the runner's spare disk.
+          sudo mkdir -p /mnt/obj && sudo chown "$(id -u)" /mnt/obj
+          MAKEOBJDIRPREFIX=/mnt/obj sh ci/kernel.sh src out/kernel ${{ matrix.kernconf }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kernel-${{ matrix.flavour }}
+          path: |
+            out/kernel/kernel.txz
+            out/kernel/kernel-info
+            out/kernel/dtb
+          retention-days: 3
+
+  image:
+    name: Images (${{ matrix.flavour }})
+    needs: [firmware, base, kernel]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        flavour: [nodebug, debug]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware-sd
+          path: inputs/firmware
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware-emmc
+          path: inputs/firmware-emmc
+      - uses: actions/download-artifact@v8
+        with:
+          name: base
+          path: inputs
+      - uses: actions/download-artifact@v8
+        with:
+          name: kernel-${{ matrix.flavour }}
+          path: inputs
+      - name: Name the images
+        run: |
+          # e.g. freebsd-16.0-current-bpi-r3-sd-20261115-62563fc15c7f-nodebug.img
+          version=$(cut -d' ' -f3 inputs/kernel-info | tr '[:upper:]' '[:lower:]')
+          prefix=freebsd-$version-bpi-r3
+          tag=$(date -u +%Y%m%d)-$(cut -d' ' -f2 inputs/kernel-info)-${{ matrix.flavour }}
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "SD=$prefix-sd-$tag.img" >> "$GITHUB_ENV"
+          echo "EMMC=$prefix-emmc-$tag.img" >> "$GITHUB_ENV"
+          echo "INSTALLER=$prefix-emmc-installer-$tag.img" >> "$GITHUB_ENV"
+      - name: Collect the build details
+        if: matrix.flavour == 'nodebug'
+        run: |
+          # For the release notes; both flavours share everything but the
+          # kernel configuration.
+          mkdir build-info
+          cp inputs/kernel-info inputs/snapshot inputs/firmware/firmware-info build-info/
+      - uses: actions/upload-artifact@v7
+        if: matrix.flavour == 'nodebug'
+        with:
+          name: build-info
+          path: build-info
+          retention-days: 3
+      - name: Assemble in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          sync: rsync
+          copyback: true
+          envs: "SD EMMC INSTALLER"
+          prepare: |
+            env ASSUME_ALWAYS_YES=yes pkg install -q gdisk
+          run: |
+            set -e
+            sh ci/image.sh inputs "$SD" 4G sd
+            # The eMMC image takes the same inputs with the eMMC firmware.
+            mkdir inputs-emmc
+            for f in kernel.txz kernel-info dtb packages snapshot; do
+              ln -s "$PWD/inputs/$f" "inputs-emmc/$f"
+            done
+            ln -s "$PWD/inputs/firmware-emmc" inputs-emmc/firmware
+            sh ci/image.sh inputs-emmc "$EMMC" 4G emmc
+            sh ci/installer.sh inputs "$EMMC" "$INSTALLER" 1G
+            for i in "$SD" "$EMMC" "$INSTALLER"; do
+              xz -T0 -6 "$i"
+            done
+            rm -rf inputs inputs-emmc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PREFIX }}-${{ env.TAG }}
+          path: |
+            ${{ env.SD }}.xz
+            ${{ env.EMMC }}.xz
+            ${{ env.INSTALLER }}.xz
+          compression-level: 0
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: freebsd-*-bpi-r3-*
+          path: release
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: bpi-r3-firmware
+          path: release
+      - uses: actions/download-artifact@v8
+        with:
+          name: build-info
+          path: build-info
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sh ci/release-notes.sh release build-info "$SRC_REPO" "$SRC_REF" \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" > notes.md
+          version=$(cut -d' ' -f3 build-info/kernel-info)
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME: FreeBSD $version for the BPI-R3" \
+            --notes-file notes.md
