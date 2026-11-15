@@ -24,6 +24,16 @@ out=$(cd "$out" && pwd)
 export MAKEOBJDIRPREFIX=${MAKEOBJDIRPREFIX:-$out/obj}
 mkdir -p "$MAKEOBJDIRPREFIX"	# make.py insists that it exists
 
+# Compile through ccache when CCACHE_DIR is set and ccache is installed:
+# the tree's own WITH_CCACHE_BUILD support, which the kernel and module
+# builds honour.  The CI keeps CCACHE_DIR between runs.
+ccache_args=
+if [ -n "${CCACHE_DIR:-}" ] && command -v ccache >/dev/null; then
+	ccache_args="WITH_CCACHE_BUILD=yes CCACHE_BIN=$(command -v ccache)"
+	mkdir -p "$CCACHE_DIR"
+	ccache -z >/dev/null
+fi
+
 # Give the build every tool by full path.  Otherwise it builds its own
 # compiler, or at least compiles all of LLVM for its own llvm-ar and
 # llvm-objcopy (Makefile.inc1, LLVM_BINUTILS_BOOTSTRAP).
@@ -52,8 +62,9 @@ FreeBSD)
 esac
 
 cd "$src"
-mk -j"$jobs" -s kernel-toolchain
-mk -j"$jobs" -s buildkernel KERNCONF="$kernconf"
+mk -j"$jobs" -s $ccache_args kernel-toolchain
+mk -j"$jobs" -s $ccache_args buildkernel KERNCONF="$kernconf"
+[ -z "$ccache_args" ] || ccache -s
 rm -rf "$out/root"
 mkdir -p "$out/root" "$out/dtb"
 mk -s installkernel KERNCONF="$kernconf" DESTDIR="$out/root" -DNO_ROOT

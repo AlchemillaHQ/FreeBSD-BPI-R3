@@ -103,8 +103,19 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             bmake bc time flex bison m4 file zlib1g-dev libbz2-dev \
             libssl-dev libarchive-dev libarchive-tools clang-18 lld-18 \
-            llvm-18 device-tree-compiler
+            llvm-18 device-tree-compiler ccache
+      # Compiler cache, one per flavour.  Each run saves under a new key
+      # and restores the newest one, so later runs only recompile what
+      # changed.  ci/kernel.sh uses ccache when CCACHE_DIR is set.
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ matrix.flavour }}-${{ github.run_id }}
+          restore-keys: ccache-${{ matrix.flavour }}-
       - name: Build
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 2G
         run: |
           # The object tree is large; /mnt has the runner's spare disk.
           sudo mkdir -p /mnt/obj && sudo chown "$(id -u)" /mnt/obj
