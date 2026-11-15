@@ -21,9 +21,9 @@ In review as [D61191](https://reviews.freebsd.org/D61191), the last
 commit of the first series. It needs D61186 to D61190, the SoC skeleton
 and clock drivers (see [clocks.md](clocks.md)). The whole series,
 rebased on current FreeBSD main, is also the branch `bpi-r3/golden` of
-<https://github.com/AlchemillaHQ/freebsd-src>. D61191 has been accepted
-by one reviewer, who noted that the clock and baud-rate details were not
-checked in depth.
+<https://github.com/AlchemillaHQ/freebsd-src>. D61191 was reworked in
+mid-November 2026 after review feedback on its clock handling; this note
+describes the reworked driver.
 
 The console works with the first series alone. UART1 and UART2 attach
 and transmit as well, but rely on firmware for their pin multiplexing
@@ -79,7 +79,10 @@ and registers it with `UART_FDT_CLASS_AND_DEVICE()`, as `uart_dev_imx.c`
 does, so the generic `uart_bus_fdt.c` attachment and the early console
 both find it by compatible. Review feedback on an earlier MediaTek
 submission (D57732) asked for this. The clock work is therefore done in
-the class methods instead of device methods.
+the class methods instead of device methods. The class's softc is
+`struct ns8250_softc` plus the two clock handles; the uart core
+allocates the softc at the class's size, as it does for
+`uart_dev_ti8250.c`.
 
 The low-level console operations wrap the ns8250 ones, because `init`
 has to program the MediaTek generator. The ns8250 `init` would write a
@@ -87,39 +90,31 @@ has to program the MediaTek generator. The ns8250 `init` would write a
 
 ### Clocks and the console
 
-- **Where clocks are taken.** The class's `UART_PROBE` method takes and
-  enables the clocks. `uart_bus_probe()` calls it after it has mapped
-  the registers and found out whether the port is the console or debug
-  port, and before any register access. So no clock is enabled while the
-  port's role is unknown.
-- **Where they are kept.** In a driver-wide list keyed by DT node, not
-  in the softc. While probing, the softc is only a `struct uart_softc`,
-  and a failed attach frees it. A repeated probe, or a new attach after
-  a failure, reuses the port's entry instead of taking new references.
-  The list is protected by the newbus topology lock.
-- **Order.** Assigned clocks first (with the clocks still off), then the
-  bus clock, then the baud clock, then the rate from the clock
-  framework. The framework does not move enable references on a
-  reparent, so the driver only reparents disabled clocks.
-- **Assigned clocks, own clocks only.** The driver applies
-  `assigned-clocks` itself rather than with `clk_set_assigned()`, and
-  only to the port's own `baud` and `bus` clocks. UART0's stock node
-  also reparents the shared `uart_sel`, which could move the clock of a
-  console on another port. Shared clocks are left alone.
-- **The console and debug port** keep the firmware's clock parents and
-  attach at the firmware's baud rate. No assigned clocks are applied to
-  them. Their clocks are never released, not even on detach: the
-  low-level console code keeps using the port. `devctl disable uart0`
-  removes the tty, and kernel messages still reach the serial line.
-- **Failures.** If probe or attach fails, the references already
-  enabled stay in the list for the next attempt. At that point the
-  driver cannot tell whether a console that has not attached yet depends
-  on a shared parent. The cost is a running clock on a port that failed
-  to attach. Detach of an ordinary port releases everything.
-- **Probe.** Ports other than the console are put back in plain 16550
-  mode (HIGHSPEED, RATEFIX_AD and FRACDIV cleared) before
-  `ns8250_bus_probe()`, which sets a 16550 divisor and times its FIFO
-  test by it.
+- **Where clocks are taken.** In the class's `UART_ATTACH` method: get
+  the `baud` and `bus` clocks, apply the node's assigned clocks with
+  `clk_set_assigned()`, enable both, and read the rate from the clock
+  framework. `UART_DETACH` releases them.
+- **Where they are kept.** In the softc. An earlier version took the
+  clocks at probe time, when the softc is not yet the driver's own, and
+  so kept them in a driver-wide list with its own code for assigned
+  clocks. Review asked for the standard way. The standard way is about
+  a hundred lines shorter.
+- **Probe.** `ns8250_bus_probe()` needs the clock rate for its timing
+  and touches the registers. So `UART_PROBE` reads the rate, and on
+  ports other than the console it enables the clocks for the duration
+  of the probe and releases them at the end. Nothing taken in probe
+  outlives it, which matters because newbus may probe a device more
+  than once. Those ports are also put back in plain 16550 mode first
+  (HIGHSPEED, RATEFIX_AD and FRACDIV cleared): the ns8250 probe sets a
+  16550 divisor and times its FIFO test by it.
+- **The console** runs on the clocks firmware set up, and firmware has
+  to set them up the way the device tree describes. That is a
+  requirement for every console UART, not a MediaTek one. Its clocks
+  are not released on detach, because the low-level console code keeps
+  using the port.
+- **Shared clocks.** In the stock device tree only UART0's node assigns
+  the parent of the shared `uart_sel`; UART1 and UART2 assign their own
+  muxes.
 - **Pins.** Attach calls `fdt_pinctrl_configure_by_name(dev, "default")`.
   Without a pinctrl driver this does nothing, and firmware's mux stays.
 - **`uc_rclk = 0`.** The class has no default clock rate. A nonzero
@@ -177,22 +172,13 @@ through a test-only kernel hook with a device mapping.
   of 8N1, 7E1, 8N2, 5N1 and 5N2, the programmed HIGHSPEED, SAMPLE_COUNT,
   SAMPLE_POINT, RATEFIX_AD and FRACDIV values match a host model of the
   computation in all 55 cases. 1 baud and 20 Mbaud are rejected.
-- **Clock references.** `devctl disable uart2` drops the enable counts
-  of `infra_uart2` and `infra_uart2_sel` from 1 and 2 to 0 and 0, and
-  closes the bus gate. `devctl enable uart2` restores 1 and 2, and the
-  port works. With UART2 disabled, its mux was moved to `uart_sel`;
-  enabling the port restored the DT's `csw_f26m_sel` before the clocks
-  were enabled, and the shared `uart_sel` kept its references
-  throughout.
-- **Console detach.** `devctl disable uart0` keeps the console's clock
-  references and bus gate. A kernel message printed meanwhile appears on
-  the serial line, and `devctl enable uart0` reattaches it.
-- **Failure paths.** A host harness built from the driver source, with
-  mocks of the FDT attachment and the clock framework, under UBSan and
-  ASan, injects every probe and attach failure for an ordinary port and
-  for the console, plus a port probed twice. In all 22 cases no clock
-  handle is left without an owner, retries reuse references, the console
-  never loses one, and no clock is reparented while enabled.
+- **Clock references.** `devctl disable uart1` drops the enable counts
+  of `infra_uart1` and `infra_uart1_sel` from 1 and 2 to 0 and 0, and
+  closes the bus gate. `devctl enable uart1` restores 1 and 2 and opens
+  the gate again.
+- **Divisor on the host.** The divisor function, compiled unmodified,
+  agrees with the model on about 63,000 combinations of clock, rate and
+  framing, and every setting it accepts is within the 3 % limit.
 - **Reset.** With UART1 or UART2 programmed at 230400 7E1, asserting
   and deasserting its INFRACFG reset returned LCR, IER and the generator
   registers to their reset values. The port worked again after
@@ -274,6 +260,10 @@ Line rates at 921600 baud, transmitting 4 MB:
   before drawing a conclusion.
 - **Testing detach.** After `devctl detach` the device loses its name
   and cannot be reattached by name. Use `devctl disable` and `enable`.
+- **Do not detach the console.** After `devctl disable uart0` and
+  `enable`, `/dev/console` still points at the tty that was freed, and
+  the kernel panics later, at shutdown. That is in the generic tty code,
+  not in this driver, but this driver is how we found it.
 - **No userland `/dev/mem` mappings** for UART registers on arm64; see
   [clocks.md](clocks.md#pitfalls).
 

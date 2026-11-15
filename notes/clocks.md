@@ -6,9 +6,9 @@ The MT7986 spreads its clock tree over three controllers: APMIXEDSYS
 MediaTek clock and reset base driver plus one table file per controller.
 
 The drivers read the clock state the boot firmware left, gate and
-reparent clocks, and implement the INFRACFG resets. They do not change
-PLL rates. TF-A programs those before FreeBSD is even loaded, and so far
-nobody has found a good reason to argue with it.
+reparent clocks, set PLL rates, and implement the INFRACFG resets. TF-A
+sets the PLLs up before FreeBSD is even loaded, and so far no driver has
+found a reason to argue with it, but the option is there.
 
 ## Status
 
@@ -27,10 +27,12 @@ branches sit on top of it.
 | [D61189](https://reviews.freebsd.org/D61189) | clk/mediatek: Add MT7986 TOPCKGEN clock controller |
 | [D61190](https://reviews.freebsd.org/D61190) | clk/mediatek: Add MT7986 INFRACFG clock and reset controller |
 
-As of 8 November 2026 these five had no review comments. Every commit
-builds on its own. With the first series alone (these five plus the
-UART), arm64 `GENERIC` boots on the BPI-R3 with the stock DTB to
-`mountroot>`, with a working console.
+The series was reworked in mid-November 2026 after the first review
+feedback, which arrived on the UART and asked, among other things, for
+set/clear registers to be the exception rather than the rule. This note
+describes the reworked code. Every commit builds on its own. With the
+first series alone (these five plus the UART), arm64 `GENERIC` boots on
+the BPI-R3 with the stock DTB to `mountroot>`, with a working console.
 
 The ETHSYS and SGMIISYS clock controllers, and a gate type they need,
 live on the `bpi-r3/ethernet` branch (see [ethernet.md](ethernet.md)).
@@ -63,7 +65,7 @@ Each PLL has a block of registers at its own offset:
 |---|---|---|
 | +0x0 | CON0 | bit 0 enable, bits 6:4 post divider (log2), bit 24 reset bar |
 | +0x4 | CON1 | PCW, all 32 bits: 7 integer bits, 25 fractional bits |
-| +0x8 | CON2 | follows CON1 when CON1 is written |
+| +0x8 | CON2 | follows CON1 when CON1 is written (the register, not the rate in use) |
 | +0xc | PWR | bit 0 power on, bit 1 isolation enable |
 
 MPLL and APLL2 are the exception: their PWR register sits at +0x10. The
@@ -90,14 +92,47 @@ The enable sequence follows TF-A: set power on, wait 1 us, clear
 isolation, wait 1 us, set enable, wait 20 us, then set the reset bar on
 the PLLs that have one. Disabling runs the same steps in reverse.
 
+Three facts about these PLLs are in no source we found. They were
+measured on APLL2, which nothing uses, with the frequency meter
+described below:
+
+- A new PCW is only taken over when the PLL is enabled. Written to a
+  running PLL it appears in CON2 at once and changes nothing else; the
+  output moves when the enable bit is cleared and set again.
+- The post divider takes effect at once. Values 0 to 4 divide by 1 to
+  16; values 5 to 7 give no usable clock.
+- The VCO followed the PCW from 1000 to 3800 MHz, the highest we tried.
+  Firmware's own settings use 1520 to 2880 MHz.
+
 ### TOPCKGEN
 
 TOPCKGEN has fixed dividers of the PLL outputs and 37 muxes. The muxes
 sit in `CLK_CFG_n` registers, 0x10 apart, with four 8-bit fields per
 register. Each field holds the selection in its low bits and a gate bit
-in bit 7 (set means gated). Writes go through set and clear registers at
-+4 and +8. A new selection takes effect only after its bit is written to
-one of the two update registers, 0x1c0 and 0x1c4.
+in bit 7 (set means gated). The registers can be written directly; there
+are set and clear registers at +4 and +8 as well. A new selection takes
+effect only after its bit is written to one of the two update registers,
+0x1c0 and 0x1c4. The gate bit works without that.
+
+### Frequency meter
+
+TOPCKGEN also contains a frequency meter. TF-A uses it for one line of
+its boot log, the CPU speed, and no document or driver says what else it
+can measure. It can measure the output of every TOPCKGEN mux, which
+makes it the most useful undocumented block on the chip.
+
+| Offset | Use |
+|---|---|
+| 0x200 | cleared while measuring, restored afterwards (as TF-A does) |
+| 0x240 | input select: bits 1:0 = 1 and bits 13:8 = n pick the output of the n-th mux, counted from 1 in `CLK_CFG` order |
+| 0x324 | bits 25:16: window in crystal cycles, minus one; bits 15:0: the count |
+| 0x320 | writing 0x1010 starts a measurement; bit 4 clears when it is done |
+
+With the longest window, 1024 cycles of the 40 MHz crystal, one count is
+about 39 kHz. A clock that is stopped or gated never finishes the
+measurement, which is a result too. The input numbering was found by
+scanning every input and matching the rates, then confirmed by switching
+muxes and watching the right input follow.
 
 ### INFRACFG
 
@@ -106,6 +141,8 @@ one of the two update registers, 0x1c0 and 0x1c4.
   status at +8. No gate or update bits.
 - Gates: three banks at 0x40, 0x50 and 0x60. Set (gate) at the base,
   clear (ungate) at +4, status at +8.
+- The mux and gate status registers are read-only: a direct write
+  changes nothing (measured). Set and clear are the only way in.
 - Software resets: three banks. Assert at the base, deassert at +4,
   status at +8. Reset id n is bit n % 32 of bank n / 32.
 
@@ -125,7 +162,8 @@ agrees with what we found.
 
 - `sys/arm64/conf/std.mediatek`: options `SOC_MEDIATEK` and
   `SOC_MEDIATEK_MT7986`, `FDT`, the ns8250 UART, and the DTB module.
-- `sys/arm64/conf/GENERIC` includes `std.mediatek`.
+- `sys/arm64/conf/GENERIC` includes `std.mediatek`, and `NOTES` lists
+  the two options, so `LINT` builds the drivers too.
 - `sys/modules/dtb/mediatek/Makefile` builds the stock
   `mt7986a-bananapi-bpi-r3.dts`.
 - Drivers are selected in `sys/conf/files.arm64` with
@@ -139,7 +177,7 @@ Files in `sys/dev/clk/mediatek/`:
 |---|---|
 | `mtk_clk.h`, `mtk_clk.c` | base driver class, table macros, resets |
 | `mtk_clk_pll.c` | PLL node, with the MT7986 register layout |
-| `mtk_clk_mux.c` | mux with set/clear registers, optional gate and update bits |
+| `mtk_clk_mux.c` | mux written directly or through set/clear registers, optional gate and update bits |
 | `mtk_clk_gate.c` | gate with set, clear and status registers |
 | `mt7986_apmixedsys.c`, `mt7986_topckgen.c`, `mt7986_infracfg.c` | tables and probe |
 
@@ -151,9 +189,10 @@ register resource, a mutex and the clock domain, and implements the
 - Fixed clocks and fixed-factor dividers use the generic `clk_fixed`.
 - Clocks of another controller are `clk_link` nodes, so lookups do not
   depend on registration order.
-- The mux and gate are our own node types. The hardware uses set/clear
-  registers and the TOPCKGEN update latch, which the generic `clk_mux`
-  and `clk_gate` cannot express.
+- The mux and gate are our own node types. TOPCKGEN's muxes need the
+  update latch, and INFRACFG's muxes and gates can only be changed
+  through set/clear registers; the generic `clk_mux` and `clk_gate` can
+  express neither.
 - A PLL table entry has only its CON0 offset, its PWR offset and its
   reset bar mask; the rest of the layout is in `mtk_clk_pll.c`.
 
@@ -162,7 +201,8 @@ register resource, a mutex and the clock domain, and implements the
 - **Critical clocks.** `CLK_NODE_CANNOT_STOP` keeps only the node itself
   from being gated, not its parents. So the base driver also takes one
   enable reference on each such clock at attach and never releases it.
-  Without that reference the system panics. The critical clocks are
+  If it cannot take one it panics, since another consumer could then
+  stop a clock the system runs on. The critical clocks are
   ARMPLL, `dramc_sel`, `dramc_md32_sel`, `sysaxi_sel`, `sysapb_sel`,
   `sgm_reg_sel`, `csw_f26m_sel`, and the two SEJ gates (`infra_sej`,
   `infra_sej_13m`), which OP-TEE uses; MediaTek's SDK marks them
@@ -173,22 +213,32 @@ register resource, a mutex and the clock domain, and implements the
   +1, TOPCKGEN at +2 and INFRACFG at +3.
 - **Registration failures panic**, naming the clock. Registered nodes
   cannot be removed once others reference them. A mux selection that the
-  table does not describe counts as a failure, because the framework has
-  no parentless clocks. Mux fields are validated at registration (shift
-  and width within 31 bits, parent count fits the field).
-- **PLL rates are fixed.** `set_freq` accepts the current rate, or a
-  rounding request that the current rate satisfies, and returns `ERANGE`
-  otherwise. Either way the request stops there. The default method
-  would pass it on to the parent and report success without changing
-  anything. Runtime PLL rate changes are deferred: no consumer needs one
-  yet, and the latch procedure on MT7986 is unknown (see Pitfalls).
+  table does not describe panics in the framework when the node is
+  initialized, as it does for the Rockchip muxes.
+- **Muxes are written directly where the hardware allows it.**
+  TOPCKGEN's mux registers are ordinary read-write registers, so a
+  change is one read-modify-write plus the update bit. INFRACFG's status
+  registers are read-only, so its muxes and gates go through set and
+  clear. An earlier version used set/clear everywhere, as Linux does;
+  review asked for plain register writes where the hardware allows them.
+- **PLL rates can be set.** A request picks the smallest post divider
+  that keeps the VCO between 1500 and 3000 MHz, the rule all eight of
+  firmware's settings follow, and then the nearest PCW. With 25
+  fractional bits that lands within about 1 Hz, so rounding up or down
+  only means taking the neighbouring PCW. A running PLL is stopped,
+  programmed and started again, because that is the only way the
+  hardware takes a new PCW. ARMPLL cannot stop, so it accepts only the
+  rate it already has; changing it needs the CPU moved to another clock
+  first. The clock framework already refuses to change a clock that
+  several consumers have enabled. There is no datasheet for the VCO
+  limits: they are firmware's range, and the measured range is wider.
 - **Reparent while disabled.** The framework does not move enable
   references when a mux changes parent. Consumers should reparent a clock
   while it is off; the UART driver does.
 - **Resets.** Only INFRACFG registers a reset provider, as the binding
-  requires `#reset-cells` there. Only the 17 ids in
-  `dt-bindings/reset/mt7986-resets.h` are accepted; any other id gets
-  `EINVAL`, since the other bits are not documented.
+  requires `#reset-cells` there. Any id within the three banks is
+  accepted. The driver keeps no list of the binding's 17 ids: they come
+  from the device tree.
 - **SPI1 clock selection.** `infra_spi1_sel` selects between `i2c_sel`
   and `spim_mst_sel`. Linux's MT7986 table uses `spi_sel`. MediaTek's
   SDK, the `sel-clk` of `spi1` in the DTS, and Linux's MT7981 driver for
@@ -206,9 +256,9 @@ register resource, a mutex and the clock domain, and implements the
 FreeBSD arrives after the firmware has done the hard part, and the
 drivers rely on it for exactly this:
 
-- TF-A BL2 programs every PLL rate (PCW and post divider) and leaves the
-  CPU, bus and DRAM clocks running. FreeBSD only gates PLLs and never
-  reprograms them.
+- TF-A BL2 sets up every PLL and leaves the CPU, bus and DRAM clocks
+  running. FreeBSD leaves the rates alone unless a consumer asks for
+  another one.
 - The console UART's clock selection and baud rate are kept as firmware
   set them (see [uart.md](uart.md)).
 - Pin multiplexing stays as firmware set it until there is a pinctrl
@@ -226,22 +276,46 @@ arm64 `GENERIC` with the series, stock DTB. Most tests used a kernel
 with a test-only hook (not part of the series) that enables, disables
 and reparents clocks, asserts resets through hwreset(9), and reads and
 writes registers through a kernel device mapping (`pmap_mapdev()`).
+The frequency meter and PLL rate tests came later and ran on a board
+with the image our CI builds.
 
 - **Clock tree against Linux.** `sysctl hw.clock` was compared with
   `/sys/kernel/debug/clk/clk_summary` from OpenWrt on the same board.
-  125 clocks match in rate and parent. Four differ, as expected:
+  123 clocks match in rate and parent. Six differ, as expected:
   `spim_mst_sel` (Linux reparents it at runtime for SPI1), `top_jtag`
-  (Linux models it with a dummy parent), and `infra_spi1_sel` and
-  `infra_spi1` (our SPI1 parent). The only Linux clocks missing are the
-  13 ETHSYS and SGMIISYS ones, which are not in this series.
+  (Linux models it with a dummy parent), `infra_spi1_sel` and
+  `infra_spi1` (our SPI1 parent), and `top_net2pll_d3_d2` with
+  `arm_db_main_sel` below it, where Linux's divider is wrong (see
+  Pitfalls). The only Linux clocks missing are the 13 ETHSYS and
+  SGMIISYS ones, which are not in this series.
+- **Every mux output, measured.** The frequency meter read all 37
+  TOPCKGEN mux outputs, and the rates were compared with
+  `sysctl hw.clock`. 36 agree. The other one has no clock at all:
+  `arm_db_jtsel` selects the external JTAG clock, and nobody was
+  driving it. One of the 36, `ap2cnn_host_sel`, agrees only after its
+  first enable (see Pitfalls). This is the test that caught the
+  `net2pll_d3_d2` divider.
 - **Write paths.** Gating `infra_pwm2` (CG0 bit 4) also gated its parent
   mux `pwm_sel` (CLK_CFG_1 bit 15); NET1PLL, held by a critical clock,
   stayed on. `a1sys_sel` switched parents through the update latch
   (CLK_CFG_5 bit 24) and its gate bit 31 toggled. APLL2 and WEDMCUPLL
   powered down and up: enable, power, isolation and WEDMCUPLL's reset bar
   were cleared and restored, and the rates were unchanged.
-- **Rate requests.** APLL2 to 40 MHz and `top_apll2_d4` to 10 MHz fail
-  with `ERANGE`; APLL2 at its current rate succeeds.
+- **PLL rates.** APLL2 was set to other rates through the test hook and
+  measured with the frequency meter: 200 MHz (same post divider),
+  180.6336 MHz (divide by 16) and 1600 MHz (divide by 1) all came out as
+  requested, with the PLL running and with it stopped. Rounding up, down
+  and to nearest picks the expected neighbour. Requests outside 93.75
+  MHz to 3 GHz fail with `ERANGE` unless the rounding points back into
+  the range, and dry runs leave the registers alone. The same on
+  WEDMCUPLL, which has a reset bar, on a boot without the Ethernet
+  driver so that nothing else held it. ARMPLL refuses any rate but its
+  own, and a PLL with several consumers is refused by the framework.
+- **PLL arithmetic on the host.** The rate-setting functions, compiled
+  unmodified against a model of the measured register behaviour, pass
+  three million random requests: rounding direction, range limits, dry
+  runs, error paths, and the rule that the PCW is never written while
+  the PLL runs.
 - **Critical clocks** each hold one enable reference, which reaches
   their PLLs. "Unresolved linked clock" is never printed.
 - **Resets.** UART1 (id 38) and UART2 (id 39): with the port programmed,
@@ -250,10 +324,7 @@ writes registers through a kernel device mapping (`pmap_mapdev()`).
   registers returned to their reset values and could be written again;
   no I2C transfer was tried. PWM (id 68): a written register returned to
   its reset value. The status register showed exactly the asserted bit.
-  Id 5 is rejected with `EINVAL`.
-- **Mux validation** was checked in a host harness built from the source
-  under UBSan: an undescribed selector gives `ENXIO`, width 31
-  registers, and width 32 and a wrapping shift give `EINVAL`.
+  An id beyond the three banks is rejected with `EINVAL`.
 
 ## Pitfalls
 
@@ -268,23 +339,30 @@ writes registers through a kernel device mapping (`pmap_mapdev()`).
   24 on NET2PLL, MMPLL, WEDMCUPLL, NET1PLL and MPLL, and the boot state
   matches exactly.
 - **CON1 bit 31 is part of the PCW**, not a "PCW change" strobe as on
-  older MediaTek SoCs. MMPLL and SGMPLL run with it set. On the unused
-  APLL2, a written bit 31 stays set and CON2 follows CON1 at once.
-  Linux's PLL code sets bit 31 as a change bit after a new PCW, which on
-  MT7986 overlaps the PCW. We suspect Linux's rate-setting path is wrong
-  here but have not reproduced a failure. How a new PCW is latched, and
-  whether the loop relocks without an enable toggle, is unknown. The
-  next step is to measure APLL2's output and settling after a controlled
-  PCW change.
+  older MediaTek SoCs. MMPLL and SGMPLL run with it set. Linux's PLL
+  code writes a new PCW and then sets bit 31 as a change bit. On MT7986
+  that bit is the PCW's top bit, and a running PLL takes no new PCW at
+  all (see Hardware), so that path cannot work here.
+- **CON2 is not a status register.** It follows CON1 the moment CON1 is
+  written, whatever the PLL is actually doing, so it says nothing about
+  the rate in use. It looks like a readback of the PLL. It is a mirror.
 - **PWR bit 31** reads 1 while a PLL runs and 0 while it is off. It did
   not drop when APLL2's PCW was changed at runtime. It is undocumented,
   so the driver does not use it as a lock indicator.
-- **`top_net2pll_d3_d2` divides by 2** in Linux, U-Boot and our table,
-  although its name and an older MediaTek SDK suggest 6. A clock name is
-  a hint, not a contract. Agreement with Linux's clock summary proves
-  nothing here, since both use the same table. TF-A has frequency meter
-  code, but it ignores its selector and overwrites a bus PLL divider, so
-  it is not a usable recipe.
+- **`top_net2pll_d3_d2` divides by 6**, as its name says. Linux and
+  U-Boot have 2, and so did our table until the frequency meter read
+  133.3 MHz where 400 MHz was expected, through two different muxes.
+  Agreement with Linux's clock summary had proved nothing, since both
+  sides used the same table. A clock name is a hint, not a contract, but
+  this time the hint was right.
+- **A mux register holds the pending selection.** After boot,
+  `ap2cnn_host_sel` reads as parent 1 while its output is still parent
+  0: firmware wrote the field and never the update bit. The first enable
+  or parent change through the driver latches it. Nothing uses this
+  clock, which is presumably how it stayed that way.
+- **Do not touch a peripheral whose clocks are gated.** A write to a PWM
+  register after gating the PWM clocks never completed, and the kernel
+  panicked a moment later. Enable first, then poke.
 - **The architected timer** runs at 12,986,200 Hz while firmware's
   CNTFRQ says 13 MHz, about 1062 ppm off. On our board ntpd pinned its
   correction at +500 ppm. A DTB `clock-frequency` override would fix it;
@@ -295,9 +373,9 @@ writes registers through a kernel device mapping (`pmap_mapdev()`).
 
 ## Open items
 
-- Runtime PLL rate changes, when a consumer (cpufreq, audio) needs them
-  or review asks for them.
-- The `net2pll_d3_d2` ratio (/2 or /6).
+- Changing ARMPLL's rate needs the CPU moved to another clock first;
+  that belongs with cpufreq.
+- The VCO limits are firmware's range, not a documented one.
 - SPI1's output rate is computed (40 MHz with firmware settings), not
   measured. That needs an SPI driver.
 - The syscon interface of TOPCKGEN and INFRACFG.
