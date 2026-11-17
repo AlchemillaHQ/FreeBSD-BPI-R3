@@ -62,7 +62,8 @@ boot switches and log in.
 
 Nothing is in the FreeBSD tree yet. If you are an ARM64 src committer, **please contact us** at
 [hello@alchemilla.io](mailto:hello@alchemilla.io).
-The first series (SoC support, clocks, resets and the UART) is in review on Phabricator;
+The first series (SoC support, clocks, resets, the UART, and three small changes to
+FreeBSD's shared 16550 UART code that the UART driver needs) is in review on Phabricator;
 everything else is well tested, ready for review and waiting its turn. We want to get the
 [golden](https://github.com/AlchemillaHQ/freebsd-src/tree/bpi-r3/golden) SoC stack
 merged before we take up any more of upstream reviewers' time, as that would be a solid
@@ -71,6 +72,7 @@ sign that the work we've done here is coherent enough to be merged upstream.
 | Part                                            | State                                                                                                                                        | Code                                                                                                          |
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | SoC support, clocks and resets                  | In review                                                                                                                                    | [D61186](https://reviews.freebsd.org/D61186) to [D61190](https://reviews.freebsd.org/D61190), `bpi-r3/golden` |
+| Baud rate generator hooks in the 16550 code     | In review (needed by the UART)                                                                                                               | [D61610](https://reviews.freebsd.org/D61610), [D61620](https://reviews.freebsd.org/D61620), [D61611](https://reviews.freebsd.org/D61611), `bpi-r3/golden` |
 | UART                                            | In review                                                                                                                                    | [D61191](https://reviews.freebsd.org/D61191), `bpi-r3/golden`                                                 |
 | SD card and eMMC                                | Ready for review (eMMC HS400, about 170 MB/s)                                                                                                | `bpi-r3/mmc`                                                                                                  |
 | Ethernet and the MT7531 switch                  | Ready for review (about 940 Mbit/s TCP both ways, checksum offload, TSO, VLAN offload)                                                       | `bpi-r3/ethernet`                                                                                             |
@@ -89,8 +91,9 @@ that runs virtual machines is now a thing you can have.
 The code lives on `bpi-r3/<feature>` branches of
 [AlchemillaHQ/freebsd-src](https://github.com/AlchemillaHQ/freebsd-src):
 
-- `bpi-r3/golden` is the series under review, rebased on current FreeBSD
-  `main`. Every other branch sits on top of it.
+- `bpi-r3/golden` is the series under review, including the three 16550
+  changes, rebased on current FreeBSD `main`. Every other branch sits on
+  top of it.
 - `bpi-r3/mmc`, `bpi-r3/ethernet`, `bpi-r3/usb`, `bpi-r3/pinctrl` and
   `bpi-r3/watchdog` each add one feature. Every commit builds on its own
   with no compiler warnings.
@@ -144,7 +147,7 @@ was tested, what went wrong, and what is left.
   on much of the documentation here, prying the facts out of our
   MediaTek vendor or piecing them together from git repositories
   scattered across the internet.
-- [Hayzam Sherif](mailto:hayzam@alchemilla.io) reviewed and helped write
+- [Hayzam Sherif](mailto:hayzam@freebsd.org) reviewed and helped write
   most of the drivers, and served as Rainy's meat proxy: Rainy and the
   board were in different states in India, and running her commands on
   it was easier than getting the board to her.

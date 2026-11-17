@@ -164,6 +164,8 @@ agrees with what we found.
   `SOC_MEDIATEK_MT7986`, `FDT`, the ns8250 UART, and the DTB module.
 - `sys/arm64/conf/GENERIC` includes `std.mediatek`, and `NOTES` lists
   the two options, so `LINT` builds the drivers too.
+- `sys/arm64/conf/MEDIATEK` is a kernel configuration with only the
+  MediaTek parts, like the ones the other SoC families have.
 - `sys/modules/dtb/mediatek/Makefile` builds the stock
   `mt7986a-bananapi-bpi-r3.dts`.
 - Drivers are selected in `sys/conf/files.arm64` with

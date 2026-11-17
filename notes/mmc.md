@@ -13,8 +13,9 @@ interrupts and descriptor DMA. On this board's eMMC it reads at about
 - Works on SD and eMMC; ready for review. The code is on branch
   `bpi-r3/mmc` of
   [AlchemillaHQ/freebsd-src](https://github.com/AlchemillaHQ/freebsd-src),
-  on top of `bpi-r3/golden` (the first series, D61186 to D61191,
-  rebased on current FreeBSD main).
+  on top of `bpi-r3/golden` (the first series, D61186 to D61191 and the
+  ns8250 changes D61610, D61620 and D61611, rebased on current FreeBSD
+  main).
 - Planned as one driver commit for SD and eMMC, to be posted after the
   first series (D61186 to D61191) is reviewed. That commit was
   boot-tested on top of the first series alone, on SD and on eMMC.

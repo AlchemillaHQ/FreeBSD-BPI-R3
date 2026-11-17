@@ -19,11 +19,18 @@ and terminals have been too polite to mention it.
 
 In review as [D61191](https://reviews.freebsd.org/D61191), the last
 commit of the first series. It needs D61186 to D61190, the SoC skeleton
-and clock drivers (see [clocks.md](clocks.md)). The whole series,
-rebased on current FreeBSD main, is also the branch `bpi-r3/golden` of
-<https://github.com/AlchemillaHQ/freebsd-src>. D61191 was reworked in
-mid-November 2026 after review feedback on its clock handling; this note
-describes the reworked driver.
+and clock drivers (see [clocks.md](clocks.md)), and three changes to the
+shared ns8250 (16550) code that let a driver supply its own baud rate
+generator: [D61610](https://reviews.freebsd.org/D61610),
+[D61620](https://reviews.freebsd.org/D61620) and
+[D61611](https://reviews.freebsd.org/D61611). The whole series, rebased
+on current FreeBSD main, is also the branch `bpi-r3/golden` of
+<https://github.com/AlchemillaHQ/freebsd-src>.
+
+D61191 was reworked twice in November 2026 after review: first its clock
+handling, then onto the ns8250 hooks, which the reviewer proposed so that
+the driver only has to provide the generator. This note describes the
+current driver.
 
 The console works with the first series alone. UART1 and UART2 attach
 and transmit as well, but rely on firmware for their pin multiplexing
@@ -84,9 +91,21 @@ the class methods instead of device methods. The class's softc is
 allocates the softc at the class's size, as it does for
 `uart_dev_ti8250.c`.
 
-The low-level console operations wrap the ns8250 ones, because `init`
-has to program the MediaTek generator. The ns8250 `init` would write a
-16550 divisor under firmware's mode 3.
+The class uses the ns8250 code for everything, the low-level console
+included. The driver hands its generator to the ns8250 code through three
+functions in `struct ns8250_softc`, which it sets before calling
+`ns8250_bus_attach()`:
+
+- `set_baudrate()` programs the MediaTek generator for a rate.
+- `get_baudrate()` reads the rate back, for `UART_IOCTL_BAUD`.
+- `get_divisor()` returns clock cycles per bit, which the ns8250 code
+  uses for its delays.
+
+While a port is being probed, the softc is still the generic one, so the
+ns8250 code uses its plain 16550 functions then (a `UART_BAS_IN_PROBE`
+flag in `struct uart_bas` tells it). The low-level console has no softc
+at all and also uses the 16550 functions, so it keeps the rate the
+firmware set and cannot program one.
 
 ### Clocks and the console
 
@@ -117,16 +136,18 @@ has to program the MediaTek generator. The ns8250 `init` would write a
   muxes.
 - **Pins.** Attach calls `fdt_pinctrl_configure_by_name(dev, "default")`.
   Without a pinctrl driver this does nothing, and firmware's mux stays.
-- **`uc_rclk = 0`.** The class has no default clock rate. A nonzero
-  value would override the clock framework's rate for the console in
-  `uart_bus_probe()`. The early console therefore starts without a rate,
-  and its `init` keeps the firmware's generator settings.
+- **No default clock rate.** The class leaves `uc_rclk` at 0. Probe and
+  attach take the rate from the clock framework, and the early console
+  keeps the firmware's generator settings.
 
 ### Baud generator
 
 - Mode 3 is used for every rate.
 - The divisor is the smallest one whose bit time fits SAMPLE_COUNT. A
-  bit must last between 4 and 256 sample periods.
+  bit must last at least 8 sample periods: below that, the manual says
+  the sender needs guard time or frames get corrupted. That rejects
+  rates above about 3.25 Mbaud at 26 MHz; the manual's maximum is
+  3 Mbaud.
 - The frame time is computed in sample periods for the actual framing.
   The remainder is spread evenly over the bits the hardware can extend:
   the data bits, the parity bit, and a stop bit only with two stop bits
@@ -137,12 +158,20 @@ has to program the MediaTek generator. The ns8250 `init` would write a
 - RATEFIX_AD is cleared when programming. It is decoded when the rate is
   read back for `UART_IOCTL_BAUD`, along with the high-speed mode, the
   framing from LCR and the FRACDIV bits that apply to it.
-- Rates more than 3 % off are rejected with `EINVAL`. The check is an
-  exact cross-multiplication. At 26 and 40 MHz, 8N1 rates up to 921600
-  baud are within 0.1 %.
-- The calculation reproduces Table 2-6 of the reference manual, except
-  at 7200 baud, where it picks the extension count closer to the
-  requested rate.
+- With at least 8 sample periods per bit, every accepted rate is within
+  3 % of the request (worst case 2.45 % in a host sweep of about 550,000
+  settings). At 26 and 40 MHz, 8N1 rates up to 921600 baud are within
+  0.1 %.
+- For the 30 MHz clock of the manual's Table 2-6, the divisor,
+  SAMPLE_COUNT, SAMPLE_POINT and the number of extended bits are the
+  table's, except at 7200 baud, where one extended bit is closer than the
+  table's two. The FRACDIV bit patterns differ, because the driver
+  spreads the extended bits evenly.
+- The generator functions take the framing from LCR as it is at that
+  moment. `ns8250_param()` sets the rate before it writes the new LCR,
+  so a single call that changes both rate and framing programs the
+  extensions for the previous framing. That is at most 0.2 % off up to
+  115200 baud at 26 MHz, until the next rate change.
 
 Values the driver programs on UART1 (26 MHz). SAMPLE_COUNT,
 SAMPLE_POINT and FRACDIV_L were read back on the board; the divisor and
@@ -157,9 +186,12 @@ the rate follow from them.
 
 ## Testing
 
-Setup as in [clocks.md](clocks.md): BPI-R3 from SD, OpenWrt's TF-A and
-U-Boot, `GENERIC` with the series, stock DTB. Register values were read
-through a test-only kernel hook with a device mapping.
+Setup as in [clocks.md](clocks.md): BPI-R3, OpenWrt's TF-A and U-Boot,
+`GENERIC` with the series, stock DTB. Register values were read through a
+test-only kernel hook with a device mapping. The series-alone, rate
+table, clock reference and host runs were repeated with the current
+driver; the console, reset and loopback runs are from the version before
+the ns8250 hooks.
 
 - **Series alone.** A kernel with only the first series attaches the
   clock controllers and the three UARTs and stops at `mountroot>` (no
@@ -171,14 +203,16 @@ through a test-only kernel hook with a device mapping.
 - **Rate table.** For 9600 to 921600, 1 and 3 Mbaud and 50 baud, in each
   of 8N1, 7E1, 8N2, 5N1 and 5N2, the programmed HIGHSPEED, SAMPLE_COUNT,
   SAMPLE_POINT, RATEFIX_AD and FRACDIV values match a host model of the
-  computation in all 55 cases. 1 baud and 20 Mbaud are rejected.
+  computation in the 51 cases that change only the rate. The 4 that
+  change rate and framing in one `stty` call get the previous framing's
+  extensions (see Baud generator). 1 baud and 20 Mbaud are rejected.
 - **Clock references.** `devctl disable uart1` drops the enable counts
   of `infra_uart1` and `infra_uart1_sel` from 1 and 2 to 0 and 0, and
   closes the bus gate. `devctl enable uart1` restores 1 and 2 and opens
   the gate again.
-- **Divisor on the host.** The divisor function, compiled unmodified,
-  agrees with the model on about 63,000 combinations of clock, rate and
-  framing, and every setting it accepts is within the 3 % limit.
+- **Divisor on the host.** The host model, which mirrors the driver and
+  reproduces Table 2-6, accepts about 550,000 combinations of clock
+  (13 to 52 MHz), rate and framing, all within 3 % of the request.
 - **Reset.** With UART1 or UART2 programmed at 230400 7E1, asserting
   and deasserting its INFRACFG reset returned LCR, IER and the generator
   registers to their reset values. The port worked again after
@@ -273,7 +307,7 @@ Line rates at 921600 baud, transmitting 4 MB:
   pinctrl driver is in the tree.
 - Why the stop extension combined with data extensions is inconsistent
   with five data bits. The driver avoids that case.
-- Review of D61191 together with the clock series.
+- Review of D61191, the clock series and the three ns8250 changes.
 
 ## References
 
@@ -285,3 +319,5 @@ Line rates at 921600 baud, transmitting 4 MB:
   https://cdn.hackaday.io/files/1861277963257568/BPI-R3-V11-SCH-Public.pdf
 - Earlier MediaTek review with feedback on the UART attachment:
   https://reviews.freebsd.org/D57732
+- The ns8250 baud rate generator hooks: https://reviews.freebsd.org/D61610,
+  https://reviews.freebsd.org/D61620, https://reviews.freebsd.org/D61611
